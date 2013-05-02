@@ -11,11 +11,13 @@ import (
 	"text/template"
 	"net/smtp"
 	"strings"
+	"path/filepath"
 )
 
-var server, from, to string
-var enable_email bool
+var server, from, to, pattern string
+var enable_email, leftpush, rightpush bool
 const dataPath = "/var/tmp/%v.txt"
+const dataDir = "/var/tmp/"
 
 func main() {
 	setup()
@@ -44,19 +46,41 @@ func main() {
 }
 
 func getQueues() (qs []string) {
-	rd := rdc.NewRedisDatabase(rdc.Configuration{})
+	set := map[string]bool{}
+	rd := rdc.Connect(rdc.Configuration{})
 	// resque* to optionally support custom namespaces
-	for _, v := range rd.Command("keys", "resque*:queue:*").Values() {
-		qs = append(qs, v.String())
+	for _, v := range rd.Command("keys", pattern).Values() {
+		set[v.String()]=true
+	}
+	// this will pull old queues that have files left
+	filepath.Walk(dataDir, func(p string, fi os.FileInfo, e error) error {
+		if ! fi.IsDir() && fi.Mode() & os.ModeSymlink != os.ModeSymlink {
+			p = filepath.Base(p)
+			if match, _ := filepath.Match(pattern, p); match {
+				e := filepath.Ext(p)
+				p = strings.Replace(p, e, "", 1) // remove extension
+				// fmt.Println(p, "match")
+				set[p]=true
+			}
+		}
+		return e
+	})
+	for k, _ := range set {
+		qs = append(qs, k)
 	}
 	return
 }
 
 func setup() {
+	// email flags
 	flag.BoolVar(&enable_email, "e", false, "enable email message")
 	flag.StringVar(&server, "s", "localhost:25", "smtp server")
 	flag.StringVar(&from, "f", "", "From: address")
 	flag.StringVar(&to, "t", "", "To: address")
+	// queue flags
+	flag.StringVar(&pattern, "p", "resque*:queue:*", "queue key pattern")
+	flag.BoolVar(&leftpush, "l", false, "left push (test index -1)")
+	flag.BoolVar(&rightpush, "r", true, "right push (test index 0)")
 
 	flag.Usage = func() {
 		fmt.Println("Usage: [options]", os.Args[0])
@@ -69,6 +93,9 @@ func setup() {
 		fmt.Println("\t3 when there is an error with the check")
 	}
 	flag.Parse()
+	if rightpush { leftpush = false }
+	if leftpush { rightpush = false }
+
 	// redis library can be chatty, shut it up
 	devnull, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	applog.SetLogger(applog.NewStandardLogger(devnull))
@@ -76,11 +103,12 @@ func setup() {
 
 // return top json blob from redis queue
 func fromRedis(q string) (s string) {
-	rd := rdc.NewRedisDatabase(rdc.Configuration{})
-	switch l, _ := rd.Command("llen", q).ValueAsInt(); {
-	case l > 0:
-		rsb := rd.Command("lindex", q, 0)
-		s = rsb.Value().String()
+	rd := rdc.Connect(rdc.Configuration{})
+	switch rightpush {
+	case true:  // rightpush
+		s = rd.Command("lindex", q, 0).Value().String()
+	case false: // leftpush
+		s = rd.Command("lindex", q, -1).Value().String()
 	}
 	return
 }
@@ -102,13 +130,17 @@ func fromDisk(q string) (str string) {
 }
 
 // store json blob from top of queue to disk for next run
-func toDisk(q string, j string) (err error) {
+func toDisk(q string, data string) (err error) {
 	path := fmt.Sprintf(dataPath, q)
 	linkCheck(path)
-	file, err := os.Create(path)
-	if err == nil {
-		defer file.Close()
-		file.WriteString(j)
+	if data == "" && exists(path) {
+		os.Remove(path)
+	} else {
+		file, err := os.Create(path)
+		if err == nil {
+			defer file.Close()
+			file.WriteString(data)
+		}
 	}
 	return
 }
@@ -119,6 +151,13 @@ func linkCheck(path string) {
 	if err == nil && finfo.Mode() & os.ModeSymlink == os.ModeSymlink {
 		exit(3, "ERROR: Data file is sym-link;", path)
 	}
+}
+
+func exists(path string) bool {
+    _, err := os.Stat(path)
+    if err == nil { return true }
+    if os.IsNotExist(err) { return false }
+    return false
 }
 
 // exit/sendmail
@@ -143,6 +182,10 @@ Subject: ({{.Host}}) {{.Msg}}
 
 Hostname: {{.Host}}
 Error: {{.Msg}}
+
+To verify run queue-ok on ${{.Host}}.
+
+	ssh {{.Host}} queue-ok
 `
 type md struct {
 	From, To, Host, Msg string
