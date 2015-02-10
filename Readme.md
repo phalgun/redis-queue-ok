@@ -29,7 +29,7 @@ their first/last entry (rpush/lpop vs lpush/rpop). If it doesn't change between
 2 calls an alert is issued (email sent/return code 2).
 
 If the queue is empty or the value from the queue is different than the saved
-value, all is ok. Make sure the queue is processes more frequently than you run
+value, all is ok. Make sure the queue is processesed more frequently than you run
 this.
 
 ## License
